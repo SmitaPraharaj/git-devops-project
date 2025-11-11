@@ -1,38 +1,74 @@
 pipeline {
-    agent any
+    agent any  // runs on any Jenkins Windows agent
+
+    environment {
+        // Optional: your Docker Hub credentials and registry
+        DOCKER_REGISTRY_CREDENTIALS = 'docker-hub-creds'
+        DOCKER_REGISTRY = 'docker.io/youruser'
+    }
+
+    options {
+        skipDefaultCheckout()  // manual checkout control
+        timestamps()
+    }
 
     stages {
-        stage('Checkout Code') {
+
+        stage('Checkout') {
             steps {
-                git branch: 'main', url: 'https://github.com/SmitaPraharaj/git-devops-project.git'
+                // checkout from GitHub (Jenkins automatically uses SCM configured in job)
+                checkout scm
             }
         }
 
-        stage('Build Docker Containers') {
+        stage('Build / Unit Tests') {
             steps {
-                sh 'docker-compose build'
+                script {
+                    // Windows uses 'bat' instead of 'sh'
+                    bat 'where git || echo Git not found'
+                    bat 'gradlew.bat -v || echo Gradle not found'
+                }
             }
         }
 
-        stage('Run Containers') {
+        stage('Build Docker image') {
+            when { expression { fileExists('Dockerfile') } }
             steps {
-                sh 'docker-compose up -d'
+                script {
+                    // Check if Docker is available
+                    bat 'docker --version'
+                    // Build Docker image
+                    bat "docker build -t %DOCKER_REGISTRY%/myapp:%BUILD_NUMBER% ."
+                }
             }
         }
 
-        stage('Verify Running Containers') {
+        stage('Push image') {
+            when { expression { env.DOCKER_REGISTRY_CREDENTIALS != null } }
             steps {
-                sh 'docker ps'
+                script {
+                    withCredentials([
+                        usernamePassword(
+                            credentialsId: env.DOCKER_REGISTRY_CREDENTIALS,
+                            usernameVariable: 'DOCKER_USER',
+                            passwordVariable: 'DOCKER_PASS'
+                        )
+                    ]) {
+                        // Log in and push image
+                        bat 'echo %DOCKER_PASS% | docker login -u "%DOCKER_USER%" --password-stdin'
+                        bat "docker push %DOCKER_REGISTRY%/myapp:%BUILD_NUMBER%"
+                    }
+                }
             }
         }
     }
 
     post {
-        success {
-            echo '✅ Build and run completed successfully!'
+        always {
+            echo "✅ Build finished: ${currentBuild.currentResult}"
         }
         failure {
-            echo '❌ Build failed. Please check the console logs.'
+            echo "❌ Build failed. Please check logs."
         }
     }
 }
