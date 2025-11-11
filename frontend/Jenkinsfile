@@ -1,0 +1,57 @@
+pipeline {
+    agent any
+
+    stages {
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main', url: 'https://github.com/SmitaPraharaj/git-devops-project.git'
+            }
+        }
+
+		stage('Detect Docker Compose') {
+			steps {
+				sh '''
+					set -e
+					if docker compose version >/dev/null 2>&1; then
+					  echo "docker compose" > .compose_cmd
+					  echo "Using Compose v2: docker compose"
+					elif command -v docker-compose >/dev/null 2>&1; then
+					  echo "docker-compose" > .compose_cmd
+					  echo "Using Compose v1: docker-compose"
+					else
+					  echo "ERROR: Docker Compose not found on this agent. Install Docker Compose v2 (preferred) or v1." >&2
+					  exit 127
+					fi
+					cat .compose_cmd
+				'''
+			}
+		}
+
+        stage('Build Docker Containers') {
+            steps {
+				sh '$(cat .compose_cmd) build'
+            }
+        }
+
+        stage('Run Containers') {
+            steps {
+				sh '$(cat .compose_cmd) up -d'
+            }
+        }
+
+        stage('Verify Running Containers') {
+            steps {
+                sh 'docker ps'
+            }
+        }
+    }
+
+    post {
+        success {
+            echo '✅ Build and run completed successfully!'
+        }
+        failure {
+            echo '❌ Build failed. Please check the console logs.'
+        }
+    }
+}
