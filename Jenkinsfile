@@ -1,74 +1,108 @@
 pipeline {
-    agent any  // runs on any Jenkins Windows agent
+  agent any
 
-    environment {
-        // Optional: your Docker Hub credentials and registry
-        DOCKER_REGISTRY_CREDENTIALS = 'docker-hub-creds'
-        DOCKER_REGISTRY = 'docker.io/youruser'
+  environment {
+    DOCKERHUB = "yourdockerhubusername"
+    IMAGE_BACKEND = "${DOCKERHUB}/devops-backend"
+    IMAGE_FRONTEND = "${DOCKERHUB}/devops-frontend"
+    DOCKERHUB_CREDS = "dockerhub-creds"        // Jenkins credentials id
+    SSH_CREDENTIALS = "ssh-deploy-key"         // Jenkins SSH key id (optional)
+    DEPLOY_HOST = "user@your.server.com"       // server for SSH deploy (optional)
+    KUBE_CONFIG = "kubeconfig"                 // credentials id for kubeconfig (optional)
+  }
+
+  stages {
+    stage('Checkout') {
+      steps {
+        git branch: 'master', url: 'https://github.com/SmitaPraharaj/git-devops-project.git'
+      }
     }
 
-    options {
-        skipDefaultCheckout()  // manual checkout control
-        timestamps()
+    stage('Install & Test Backend') {
+      steps {
+        dir('backend') {
+          sh 'npm ci'
+          sh 'npm test || echo "Backend tests failed"'
+        }
+      }
     }
 
-    stages {
-
-        stage('Checkout') {
-            steps {
-                // checkout from GitHub (Jenkins automatically uses SCM configured in job)
-                checkout scm
-            }
+    stage('Install & Test Frontend') {
+      steps {
+        dir('frontend') {
+          sh 'npm ci'
+          sh 'npm test || echo "Frontend tests failed"'
         }
-
-        stage('Build / Unit Tests') {
-            steps {
-                script {
-                    // Windows uses 'bat' instead of 'sh'
-                    bat 'where git || echo Git not found'
-                    bat 'gradlew.bat -v || echo Gradle not found'
-                }
-            }
-        }
-
-        stage('Build Docker image') {
-            when { expression { fileExists('Dockerfile') } }
-            steps {
-                script {
-                    // Check if Docker is available
-                    bat 'docker --version'
-                    // Build Docker image
-                    bat "docker build -t %DOCKER_REGISTRY%/myapp:%BUILD_NUMBER% ."
-                }
-            }
-        }
-
-        stage('Push image') {
-            when { expression { env.DOCKER_REGISTRY_CREDENTIALS != null } }
-            steps {
-                script {
-                    withCredentials([
-                        usernamePassword(
-                            credentialsId: env.DOCKER_REGISTRY_CREDENTIALS,
-                            usernameVariable: 'DOCKER_USER',
-                            passwordVariable: 'DOCKER_PASS'
-                        )
-                    ]) {
-                        // Log in and push image
-                        bat 'echo %DOCKER_PASS% | docker login -u "%DOCKER_USER%" --password-stdin'
-                        bat "docker push %DOCKER_REGISTRY%/myapp:%BUILD_NUMBER%"
-                    }
-                }
-            }
-        }
+      }
     }
 
-    post {
-        always {
-            echo "✅ Build finished: ${currentBuild.currentResult}"
+    stage('Build Docker Images') {
+      steps {
+        // build images and tag with commit id
+        script {
+          def shortSha = sh(script: "git rev-parse --short HEAD", returnStdout: true).trim()
+          sh "docker build -t ${IMAGE_BACKEND}:${shortSha} ./backend"
+          sh "docker build -t ${IMAGE_FRONTEND}:${shortSha} ./frontend"
+
+          // also tag latest (optional)
+          sh "docker tag ${IMAGE_BACKEND}:${shortSha} ${IMAGE_BACKEND}:latest"
+          sh "docker tag ${IMAGE_FRONTEND}:${shortSha} ${IMAGE_FRONTEND}:latest"
+
+          // stash the sha for later
+          writeFile file: 'image-sha.txt', text: shortSha
+          archiveArtifacts artifacts: 'image-sha.txt', fingerprint: true
         }
-        failure {
-            echo "❌ Build failed. Please check logs."
-        }
+      }
     }
+
+    stage('Push to Docker Hub') {
+      steps {
+        withCredentials([usernamePassword(credentialsId: "${DOCKERHUB_CREDS}", usernameVariable: 'DH_USER', passwordVariable: 'DH_PASS')]) {
+          script {
+            sh 'echo $DH_PASS | docker login -u $DH_USER --password-stdin'
+            def sha = readFile('image-sha.txt').trim()
+            sh "docker push ${IMAGE_BACKEND}:${sha}"
+            sh "docker push ${IMAGE_BACKEND}:latest"
+            sh "docker push ${IMAGE_FRONTEND}:${sha}"
+            sh "docker push ${IMAGE_FRONTEND}:latest"
+            sh 'docker logout'
+          }
+        }
+      }
+    }
+
+    stage('Deploy - SSH to VM (docker-compose)') {
+      when { expression { return env.DEPLOY_HOST != null && env.SSH_CREDENTIALS != "" } }
+      steps {
+        sshagent (credentials: [SSH_CREDENTIALS]) {
+          // copy docker-compose (optional) or run remote commands to pull images & restart
+          script {
+            def sha = readFile('image-sha.txt').trim()
+            sh "ssh -o StrictHostKeyChecking=no ${DEPLOY_HOST} 'docker pull ${IMAGE_BACKEND}:${sha} && docker pull ${IMAGE_FRONTEND}:${sha} && cd /path/to/compose && docker-compose pull && docker-compose up -d --remove-orphans'"
+          }
+        }
+      }
+    }
+
+    stage('Deploy - Kubernetes (kubectl)') {
+      when { expression { return env.KUBE_CONFIG != null && env.KUBE_CONFIG != "" } }
+      steps {
+        withCredentials([file(credentialsId: "${KUBE_CONFIG}", variable: 'KUBECONF')]) {
+          script {
+            def sha = readFile('image-sha.txt').trim()
+            // set KUBECONFIG to use kubectl
+            sh 'export KUBECONFIG=${KUBECONF}'
+            // update images on deployments (example names: backend-deploy, frontend-deploy)
+            sh "kubectl set image deployment/backend-deploy backend=${IMAGE_BACKEND}:${sha} --record || true"
+            sh "kubectl set image deployment/frontend-deploy frontend=${IMAGE_FRONTEND}:${sha} --record || true"
+          }
+        }
+      }
+    }
+  } // stages
+
+  post {
+    success { echo "Pipeline finished successfully" }
+    failure { echo "Pipeline failed" }
+  }
 }
